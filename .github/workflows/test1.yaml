@@ -1,4 +1,4 @@
-name: Create AWS Secret via CloudFormation
+name: Testing test1
 
 on:
   workflow_dispatch:
