@@ -1,0 +1,173 @@
+name: Create AWS Secret via CloudFormation
+
+on:
+  workflow_dispatch:
+    inputs:
+      parameter_file:
+        description: 'Parameter file name (without path)'
+        required: true
+        default: 'secret-params.json'
+      environment:
+        description: 'Environment (dev/qa/staging/prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1  # Change to your preferred region
+
+jobs:
+  create-secret:
+    name: Create Secret in AWS Secrets Manager
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::789406175361:role/GitHubActionsOIDCRole
+          aws-region: ap-south-1
+          role-session-name: GitHubActions-CreateSecret
+
+      - name: Read Parameter File
+        id: read-params
+        run: |
+          PARAM_FILE="parameters/${{ github.event.inputs.parameter_file }}"
+          
+          if [ ! -f "$PARAM_FILE" ]; then
+            echo "Error: Parameter file $PARAM_FILE not found"
+            exit 1
+          fi
+          
+          echo "Reading parameters from $PARAM_FILE"
+          cat "$PARAM_FILE"
+          
+          # Extract parameters using jq
+          SECRET_NAME=$(jq -r '.SecretName' "$PARAM_FILE")
+          SECRET_DESCRIPTION=$(jq -r '.Description // "Managed by CloudFormation"' "$PARAM_FILE")
+          SECRET_VALUE=$(jq -r '.SecretValue' "$PARAM_FILE")
+          KMS_KEY_ID=$(jq -r '.KmsKeyId // ""' "$PARAM_FILE")
+          
+          # Validate required parameters
+          if [ -z "$SECRET_NAME" ] || [ "$SECRET_NAME" == "null" ]; then
+            echo "Error: SecretName is required in parameter file"
+            exit 1
+          fi
+          
+          if [ -z "$SECRET_VALUE" ] || [ "$SECRET_VALUE" == "null" ]; then
+            echo "Error: SecretValue is required in parameter file"
+            exit 1
+          fi
+          
+          # Set outputs (mask sensitive data)
+          echo "secret-name=$SECRET_NAME" >> $GITHUB_OUTPUT
+          echo "secret-description=$SECRET_DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "::add-mask::$SECRET_VALUE"
+          echo "secret-value=$SECRET_VALUE" >> $GITHUB_OUTPUT
+          echo "kms-key-id=$KMS_KEY_ID" >> $GITHUB_OUTPUT
+          
+          # Create stack name
+          STACK_NAME="secret-${SECRET_NAME}-${{ github.event.inputs.environment }}"
+          echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
+          
+          echo "✅ Parameters validated successfully"
+          echo "Secret Name: $SECRET_NAME"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Stack Name: $STACK_NAME"
+
+      - name: Deploy CloudFormation Stack
+        id: deploy-stack
+        run: |
+          STACK_NAME="${{ steps.read-params.outputs.stack-name }}"
+          SECRET_NAME="${{ steps.read-params.outputs.secret-name }}"
+          SECRET_DESCRIPTION="${{ steps.read-params.outputs.secret-description }}"
+          SECRET_VALUE="${{ steps.read-params.outputs.secret-value }}"
+          KMS_KEY_ID="${{ steps.read-params.outputs.kms-key-id }}"
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          
+          echo "Deploying CloudFormation stack: $STACK_NAME"
+          
+          # Build parameter overrides
+          PARAM_OVERRIDES="ParameterKey=SecretName,ParameterValue=$SECRET_NAME"
+          PARAM_OVERRIDES="$PARAM_OVERRIDES ParameterKey=SecretDescription,ParameterValue=\"$SECRET_DESCRIPTION\""
+          PARAM_OVERRIDES="$PARAM_OVERRIDES ParameterKey=SecretValue,ParameterValue=\"$SECRET_VALUE\""
+          PARAM_OVERRIDES="$PARAM_OVERRIDES ParameterKey=Environment,ParameterValue=$ENVIRONMENT"
+          
+          if [ ! -z "$KMS_KEY_ID" ] && [ "$KMS_KEY_ID" != "null" ]; then
+            PARAM_OVERRIDES="$PARAM_OVERRIDES ParameterKey=KmsKeyId,ParameterValue=$KMS_KEY_ID"
+          fi
+          
+          # Deploy the stack
+          aws cloudformation deploy \
+            --template-file cloudformation/secret-manager.yaml \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+                SecretName="$SECRET_NAME" \
+                SecretDescription="$SECRET_DESCRIPTION" \
+                SecretValue="$SECRET_VALUE" \
+                Environment="$ENVIRONMENT" \
+                $( [ -n "$KMS_KEY_ID" ] && echo KmsKeyId="$KMS_KEY_ID" ) \
+            --tags \
+                Environment="$ENVIRONMENT" \
+                ManagedBy=GitHub-Actions \
+                Repository="${{ github.repository }}" \
+            --no-fail-on-empty-changeset
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Stack deployment completed successfully"
+          else
+            echo "❌ Stack deployment failed"
+            exit 1
+          fi
+
+      - name: Get Secret ARN
+        id: get-arn
+        run: |
+          STACK_NAME="${{ steps.read-params.outputs.stack-name }}"
+          
+          echo "Retrieving Secret ARN from stack outputs..."
+          
+          SECRET_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SecretArn'].OutputValue" \
+            --output text)
+          
+          if [ -z "$SECRET_ARN" ]; then
+            echo "❌ Failed to retrieve Secret ARN"
+            exit 1
+          fi
+          
+          echo "secret-arn=$SECRET_ARN" >> $GITHUB_OUTPUT
+          echo "✅ Secret ARN: $SECRET_ARN"
+
+      - name: Display Summary
+        run: |
+          echo "## 🎉 Secret Creation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Secret Name** | ${{ steps.read-params.outputs.secret-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Stack Name** | ${{ steps.read-params.outputs.stack-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Secret ARN** | \`${{ steps.get-arn.outputs.secret-arn }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Secret ARN" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.get-arn.outputs.secret-arn }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+    outputs:
+      secret-arn: ${{ steps.get-arn.outputs.secret-arn }}
+      secret-name: ${{ steps.read-params.outputs.secret-name }}
+      stack-name: ${{ steps.read-params.outputs.stack-name }}
